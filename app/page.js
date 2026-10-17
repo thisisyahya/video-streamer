@@ -1,4 +1,6 @@
+"use client";
 import Link from "next/link";
+import { signIn, signOut, useSession } from "next-auth/react";
 
 /* ---------------- MOCK DATA ---------------- */
 const MOVIE = {
@@ -28,8 +30,37 @@ const PlayIcon = () => (
 
 /* ---------------- PAGE ---------------- */
 export default function MoviePage() {
+  const { data: session, status } = useSession();
   return (
     <div className="min-h-screen bg-[#141414] font-sans text-white antialiased">
+
+
+      {/* NAVBAR */}
+      <header className="absolute left-0 right-0 top-0 z-50 flex items-center justify-between px-4 py-5 md:px-[4%]">
+        <Link href="/" className="text-3xl font-black text-[#E50914]">
+          COWATCH
+        </Link>
+
+        {status !== "loading" && (
+          session ? (
+            <button
+              onClick={() => signOut()}
+              className="rounded bg-white px-5 py-2 font-bold text-black hover:bg-gray-200"
+            >
+              Logout
+            </button>
+          ) : (
+            <button
+              onClick={() => signIn("google")}
+              className="rounded bg-[#E50914] px-5 py-2 font-bold text-white hover:bg-red-700"
+            >
+              Login
+            </button>
+          )
+        )}
+      </header>
+
+
       <main>
         {/* HERO */}
         <section className="relative h-[70vh] min-h-[480px] w-full overflow-hidden md:h-[85vh]">
@@ -98,7 +129,7 @@ export default function MoviePage() {
               <span className="text-[#e5e5e5]">{MOVIE.mood.join(", ")}</span>
             </p>
           </div>
-        </section>
+        </section>a
       </main>
     </div>
   );

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { useRouter } from "next/navigation";
+import { useSession } from "next-auth/react";
 import Pusher from "pusher-js";
 
 const MOVIE_PATCHES = [
@@ -15,17 +15,16 @@ const MOVIE_PATCHES = [
 ];
 
 export default function PatchMoviePlayer() {
-  const router = useRouter();
+  const { data: session, status: sessionStatus } = useSession();
+  const isAdmin = session?.user?.isAdmin === true;
 
   const [currentPatchIdx, setCurrentPatchIdx] = useState(0);
   const [activePlayer, setActivePlayer] = useState("A");
-  const [isMuted, setIsMuted] = useState(true);
-  const [isFullscreen, setIsFullscreen] = useState(false);
-  const [, setStatus] = useState("");
+  const [, setStatus] = useState("Loading video...");
 
-  const containerRef = useRef(null);
   const videoRefA = useRef(null);
   const videoRefB = useRef(null);
+  const playerContainerRef = useRef(null);
 
   const patchRef = useRef(0);
   const activeRef = useRef("A");
@@ -34,14 +33,16 @@ export default function PatchMoviePlayer() {
   const pendingTransitionRef = useRef(null);
   const transitionBusyRef = useRef(false);
   const pusherRef = useRef(null);
+  const channelRef = useRef(null);
 
+  // Keep current values available to asynchronous event handlers.
   patchRef.current = currentPatchIdx;
   activeRef.current = activePlayer;
 
   const nextPatchIdx =
     currentPatchIdx + 1 < MOVIE_PATCHES.length ? currentPatchIdx + 1 : null;
 
-  // The active player plays the current patch.
+  // The active player owns the current patch.
   // The inactive player preloads the next patch.
   const sourceA =
     activePlayer === "A"
@@ -95,7 +96,8 @@ export default function PatchMoviePlayer() {
 
     const targetTime =
       event.action === "play" && event.serverTimestamp
-        ? event.time + Math.max(0, Date.now() - event.serverTimestamp) / 1000
+        ? event.time +
+          Math.max(0, Date.now() - event.serverTimestamp) / 1000
         : event.time;
 
     const safeTarget = Math.min(
@@ -110,7 +112,10 @@ export default function PatchMoviePlayer() {
     if (event.action === "play") {
       video.play().catch((error) => {
         console.error("Remote playback failed:", error);
+        setStatus("Press Play to allow playback.");
       });
+    } else {
+      video.pause();
     }
 
     setTimeout(() => {
@@ -120,6 +125,7 @@ export default function PatchMoviePlayer() {
     return true;
   }, []);
 
+  // Apply a remote command after the new patch has loaded.
   const handleLoadedMetadata = useCallback(
     (event) => {
       const video = event.currentTarget;
@@ -141,7 +147,7 @@ export default function PatchMoviePlayer() {
     [applyRemoteEvent, getActiveVideo]
   );
 
-  // Switch to the preloaded patch once it has enough data.
+  // Complete a patch transition only when the next video has data.
   const completeTransition = useCallback(
     async (video) => {
       const pending = pendingTransitionRef.current;
@@ -160,6 +166,8 @@ export default function PatchMoviePlayer() {
 
       try {
         video.currentTime = 0;
+
+        // Start the next patch before switching visibility.
         await video.play();
 
         activeRef.current = pending.player;
@@ -172,6 +180,7 @@ export default function PatchMoviePlayer() {
         await sendSyncEvent("play", 0, pending.patchIndex);
       } catch (error) {
         console.error("Patch transition failed:", error);
+        setStatus("Next patch could not start. Press Play to retry.");
       } finally {
         transitionBusyRef.current = false;
       }
@@ -183,6 +192,7 @@ export default function PatchMoviePlayer() {
     (event) => {
       const video = event.currentTarget;
 
+      // Ignore ended events from the hidden/preloading player.
       if (video !== getActiveVideo()) return;
 
       const nextIdx = patchRef.current + 1;
@@ -203,22 +213,28 @@ export default function PatchMoviePlayer() {
 
       if (nextVideo?.readyState >= 2) {
         completeTransition(nextVideo);
+      } else {
+        setStatus("Preparing next patch...");
       }
     },
     [completeTransition, getActiveVideo, getInactiveVideo]
   );
 
-  // Pusher sync.
+  // Subscribe once to Pusher.
   useEffect(() => {
     const key = process.env.NEXT_PUBLIC_PUSHER_KEY;
     const cluster = process.env.NEXT_PUBLIC_PUSHER_CLUSTER;
 
-    if (!key || !cluster) return;
+    if (!key || !cluster) {
+      setStatus("Missing Pusher configuration");
+      return;
+    }
 
     const pusher = new Pusher(key, { cluster });
     const channel = pusher.subscribe("movie-room");
 
     pusherRef.current = pusher;
+    channelRef.current = channel;
 
     const handleSync = (data) => {
       if (
@@ -233,6 +249,7 @@ export default function PatchMoviePlayer() {
         return;
       }
 
+      // Ignore our own events when handling local playback.
       if (syncingRef.current) return;
 
       const video = getActiveVideo();
@@ -240,8 +257,10 @@ export default function PatchMoviePlayer() {
 
       if (data.patchIndex !== patchRef.current) {
         pendingRemoteRef.current = data;
+
         patchRef.current = data.patchIndex;
         setCurrentPatchIdx(data.patchIndex);
+        setStatus("Synchronizing video...");
         return;
       }
 
@@ -258,203 +277,136 @@ export default function PatchMoviePlayer() {
       channel.unbind("sync-event", handleSync);
       pusher.unsubscribe("movie-room");
       pusher.disconnect();
+
       pusherRef.current = null;
+      channelRef.current = null;
     };
   }, [applyRemoteEvent, getActiveVideo]);
 
-  // Redirect to /movie when the player is made small (leaves fullscreen).
+  // Autoplay on wide screens only (768px and up).
   useEffect(() => {
-    let wasFullscreen = false;
+    const isWide = window.matchMedia("(min-width: 768px)").matches;
+    if (!isWide) return;
 
-    const handleFullscreenChange = () => {
-      const inFullscreen = !!document.fullscreenElement;
-      setIsFullscreen(inFullscreen);
-
-      if (inFullscreen) {
-        wasFullscreen = true;
-      } else if (wasFullscreen) {
-        router.push("/movie");
-      }
-    };
-
-    // iPhone Safari uses its own video fullscreen, which fires this event on exit.
-    const handleIosFullscreenEnd = () => router.push("/movie");
-
-    const videos = [videoRefA.current, videoRefB.current].filter(Boolean);
-
-    document.addEventListener("fullscreenchange", handleFullscreenChange);
-    videos.forEach((v) =>
-      v.addEventListener("webkitendfullscreen", handleIosFullscreenEnd)
-    );
-
-    return () => {
-      document.removeEventListener("fullscreenchange", handleFullscreenChange);
-      videos.forEach((v) =>
-        v.removeEventListener("webkitendfullscreen", handleIosFullscreenEnd)
-      );
-    };
-  }, [router]);
-
-  // Start playback on load and after each patch change.
-  useEffect(() => {
     const video = activePlayer === "A" ? videoRefA.current : videoRefB.current;
     if (!video) return;
 
-    const start = () => {
-      video.play().catch(() => {});
+    const startPlayback = async () => {
+      try {
+        video.muted = false;
+        await video.play();
+      } catch {
+        // Browsers block unmuted autoplay until the user interacts with the page,
+        // so fall back to muted playback.
+        video.muted = true;
+        video.play().catch(() => {});
+      }
     };
 
     if (video.readyState >= 2) {
-      start();
+      startPlayback();
       return;
     }
 
-    video.addEventListener("canplay", start, { once: true });
-    return () => video.removeEventListener("canplay", start);
-  }, [activePlayer, currentPatchIdx]);
+    video.addEventListener("canplay", startPlayback, { once: true });
+    return () => video.removeEventListener("canplay", startPlayback);
+  }, [activePlayer, sourceA, sourceB]);
 
-  // Apply the mute setting to both players.
-  useEffect(() => {
-    if (videoRefA.current) videoRefA.current.muted = isMuted;
-    if (videoRefB.current) videoRefB.current.muted = isMuted;
-  }, [isMuted]);
-
-  const toggleMute = () => {
-    setIsMuted((prev) => !prev);
-  };
-
-  // Enter fullscreen on a click (browsers require a user gesture).
+  // Click handler: enter fullscreen and start playback with sound.
   const enterFullscreen = async () => {
-    setIsMuted(false);
+    // If already fullscreen, let the native controls handle clicks.
+    if (document.fullscreenElement) return;
 
     const video = getActiveVideo();
+    const container = playerContainerRef.current;
+    if (!video) return;
+
+    video.muted = false;
+    if (video.paused) {
+      video.play().catch(() => {});
+    }
 
     try {
-      if (containerRef.current?.requestFullscreen) {
-        await containerRef.current.requestFullscreen();
-      } else if (video?.webkitEnterFullscreen) {
+      if (container?.requestFullscreen) {
+        await container.requestFullscreen();
+      } else if (video.webkitEnterFullscreen) {
+        // iPhone Safari only allows fullscreen on the video element itself.
         video.webkitEnterFullscreen();
       }
     } catch {
-      if (video?.webkitEnterFullscreen) {
+      // Fall back to the video element's own fullscreen (iOS Safari).
+      if (video.webkitEnterFullscreen) {
         video.webkitEnterFullscreen();
       }
     }
-  };
-
-  // Make the player small: leave fullscreen and go back to /movie.
-  const minimize = async () => {
-    if (document.fullscreenElement) {
-      try {
-        await document.exitFullscreen();
-      } catch {
-        // Ignore. The redirect below still runs.
-      }
-      // fullscreenchange also redirects, but push here so the click always works.
-    }
-    router.push("/movie");
-  };
-
-  // Playback cannot be paused by the viewer: resume if it stops.
-  const handlePause = (event) => {
-    const video = event.currentTarget;
-    if (video !== getActiveVideo()) return;
-    if (video.ended) return;
-
-    video.play().catch(() => {});
   };
 
   const handlePlay = (event) => {
     const video = event.currentTarget;
-    if (video !== getActiveVideo()) return;
 
-    if (!syncingRef.current) {
+    if (video !== getActiveVideo()) return;
+    setStatus("Playing");
+
+    if (isAdmin && !syncingRef.current) {
       sendSyncEvent("play", video.currentTime, patchRef.current);
     }
   };
 
+  const handlePause = (event) => {
+    const video = event.currentTarget;
+
+    if (video !== getActiveVideo()) return;
+
+    if (!video.ended) setStatus("Paused");
+
+    if (isAdmin && !syncingRef.current && !video.ended) {
+      sendSyncEvent("pause", video.currentTime, patchRef.current);
+    }
+  };
+
+  // Avoid a flash of no-controls before the session finishes loading.
+  if (sessionStatus === "loading") {
+    return <div className="fixed inset-0 bg-black" />;
+  }
+
   return (
-    <div
-      ref={containerRef}
-      className="fixed inset-0 z-50 overflow-hidden bg-black"
-    >
-      <video
-        ref={videoRefA}
-        src={sourceA || undefined}
-        autoPlay
-        muted
-        playsInline
-        preload="auto"
-        onLoadedMetadata={handleLoadedMetadata}
-        onCanPlay={(event) => completeTransition(event.currentTarget)}
-        onPlay={handlePlay}
-        onPause={handlePause}
-        onEnded={handlePatchEnded}
-        className={`absolute inset-0 h-full w-full object-contain ${
-          activePlayer === "A" ? "visible" : "invisible pointer-events-none"
-        }`}
-      />
+    <div className="fixed inset-0 bg-black">
+      <div
+        ref={playerContainerRef}
+        onClick={enterFullscreen}
+        className="relative h-full w-full bg-black"
+      >
+        <video
+          ref={videoRefA}
+          src={sourceA || undefined}
+          controls={isAdmin && activePlayer === "A"}
+          playsInline
+          preload="auto"
+          onLoadedMetadata={handleLoadedMetadata}
+          onCanPlay={(event) => completeTransition(event.currentTarget)}
+          onPlay={handlePlay}
+          onPause={handlePause}
+          onEnded={handlePatchEnded}
+          className={`absolute inset-0 h-full w-full object-contain ${
+            activePlayer === "A" ? "visible" : "invisible pointer-events-none"
+          }`}
+        />
 
-      <video
-        ref={videoRefB}
-        src={sourceB || undefined}
-        muted
-        playsInline
-        preload="auto"
-        onLoadedMetadata={handleLoadedMetadata}
-        onCanPlay={(event) => completeTransition(event.currentTarget)}
-        onPlay={handlePlay}
-        onPause={handlePause}
-        onEnded={handlePatchEnded}
-        className={`absolute inset-0 h-full w-full object-contain ${
-          activePlayer === "B" ? "visible" : "invisible pointer-events-none"
-        }`}
-      />
-
-      {/* Controls: fullscreen, minimize, and audio */}
-      <div className="absolute bottom-6 right-6 z-10 flex items-center gap-3">
-        <button
-          type="button"
-          onClick={toggleMute}
-          aria-label={isMuted ? "Unmute" : "Mute"}
-          className="grid h-11 w-11 place-items-center rounded-full bg-black/60 text-white"
-        >
-          {isMuted ? (
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="h-6 w-6">
-              <path d="M11 5L6 9H2v6h4l5 4V5z" />
-              <path d="M22 9l-6 6M16 9l6 6" />
-            </svg>
-          ) : (
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="h-6 w-6">
-              <path d="M11 5L6 9H2v6h4l5 4V5z" />
-              <path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14" />
-            </svg>
-          )}
-        </button>
-
-        {!isFullscreen && (
-          <button
-            type="button"
-            onClick={enterFullscreen}
-            aria-label="Full screen"
-            className="grid h-11 w-11 place-items-center rounded-full bg-black/60 text-white"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="h-6 w-6">
-              <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
-            </svg>
-          </button>
-        )}
-
-        <button
-          type="button"
-          onClick={minimize}
-          aria-label="Minimize"
-          className="grid h-11 w-11 place-items-center rounded-full bg-black/60 text-white"
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="h-6 w-6">
-            <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" />
-          </svg>
-        </button>
+        <video
+          ref={videoRefB}
+          src={sourceB || undefined}
+          controls={isAdmin && activePlayer === "B"}
+          playsInline
+          preload="auto"
+          onLoadedMetadata={handleLoadedMetadata}
+          onCanPlay={(event) => completeTransition(event.currentTarget)}
+          onPlay={handlePlay}
+          onPause={handlePause}
+          onEnded={handlePatchEnded}
+          className={`absolute inset-0 h-full w-full object-contain ${
+            activePlayer === "B" ? "visible" : "invisible pointer-events-none"
+          }`}
+        />
       </div>
     </div>
   );
