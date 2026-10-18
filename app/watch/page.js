@@ -264,7 +264,7 @@ export default function PatchMoviePlayer() {
         setStatus("Preparing next patch...");
       }
     },
-    [completeTransition, getActiveVideo, getInactiveVideo]
+    [completeTransition, getActiveVideo, getInactiveVideo,isAdmin]
   );
 
   // Subscribe once to Pusher.
@@ -330,79 +330,89 @@ export default function PatchMoviePlayer() {
     };
   }, [applyRemoteEvent, getActiveVideo]);
 
-  // Autoplay on wide screens only (768px and up).
-  useEffect(() => {
-    const isWide = window.matchMedia("(min-width: 768px)").matches;
-    if (!isWide) return;
+  // // Autoplay on wide screens only (768px and up).
+  // useEffect(() => {
+  //   const isWide = window.matchMedia("(min-width: 768px)").matches;
+  //   if (!isWide) return;
 
-    const video = activePlayer === "A" ? videoRefA.current : videoRefB.current;
-    if (!video) return;
+  //   const video = activePlayer === "A" ? videoRefA.current : videoRefB.current;
+  //   if (!video) return;
 
-    const startPlayback = async () => {
-      try {
-        video.muted = false;
-        await video.play();
-      } catch {
-        // Browsers block unmuted autoplay until the user interacts with the page,
-        // so fall back to muted playback.
-        video.muted = true;
-        video.play().catch(() => {});
-      }
-    };
+  //   const startPlayback = async () => {
+  //     try {
+  //       video.muted = false;
+  //       await video.play();
+  //     } catch {
+  //       // Browsers block unmuted autoplay until the user interacts with the page,
+  //       // so fall back to muted playback.
+  //       video.muted = true;
+  //       video.play().catch(() => {});
+  //     }
+  //   };
 
-    if (video.readyState >= 2) {
-      startPlayback();
-      return;
-    }
+  //   if (video.readyState >= 2) {
+  //     startPlayback();
+  //     return;
+  //   }
 
-    video.addEventListener("canplay", startPlayback, { once: true });
-    return () => video.removeEventListener("canplay", startPlayback);
-  }, [activePlayer, sourceA, sourceB]);
+  //   video.addEventListener("canplay", startPlayback, { once: true });
+  //   return () => video.removeEventListener("canplay", startPlayback);
+  // }, [activePlayer, sourceA, sourceB]);
 
   // Click handler: enter fullscreen and start playback with sound.
-  const enterFullscreen = async () => {
-    // If already fullscreen, let the native controls handle clicks.
-    if (document.fullscreenElement) return;
+const enterFullscreen = async () => {
+  const video = getActiveVideo();
+  const container = playerContainerRef.current;
 
-    const video = getActiveVideo();
-    const container = playerContainerRef.current;
-    if (!video) return;
+  if (!video) return;
 
+  // Only the admin can start playback.
+  if (isAdmin && video.paused) {
     video.muted = false;
-    if (video.paused) {
-      video.play().catch(() => {});
+    video.play().catch(() => {});
+  }
+
+  if (document.fullscreenElement) return;
+
+  try {
+    if (container?.requestFullscreen) {
+      await container.requestFullscreen();
+    } else if (video.webkitEnterFullscreen) {
+      video.webkitEnterFullscreen();
     }
-
-    try {
-      if (container?.requestFullscreen) {
-        await container.requestFullscreen();
-      } else if (video.webkitEnterFullscreen) {
-        // iPhone Safari only allows fullscreen on the video element itself.
-        video.webkitEnterFullscreen();
-      }
-    } catch {
-      // Fall back to the video element's own fullscreen (iOS Safari).
-      if (video.webkitEnterFullscreen) {
-        video.webkitEnterFullscreen();
-      }
+  } catch {
+    if (video.webkitEnterFullscreen) {
+      video.webkitEnterFullscreen();
     }
-  };
+  }
+};
 
-  const handlePlay = (event) => {
-    const video = event.currentTarget;
+  
+const handlePlay = (event) => {
+  const video = event.currentTarget;
 
-    if (video !== getActiveVideo()) return;
-    setStatus("Playing");
+  if (video !== getActiveVideo()) return;
 
-    if (isAdmin && !syncingRef.current) {
-      sendSyncEvent("play", video.currentTime, patchRef.current);
-    }
-  };
+  // Block playback initiated locally by non-admins.
+  // Remote admin commands set syncingRef.current to true.
+  if (!isAdmin && !syncingRef.current) {
+    video.pause();
+    return;
+  }
+
+  setStatus("Playing");
+
+  if (isAdmin && !syncingRef.current) {
+    sendSyncEvent("play", video.currentTime, patchRef.current);
+  }
+};
 
   const handlePause = (event) => {
     const video = event.currentTarget;
 
     if (video !== getActiveVideo()) return;
+    // Only the admin advances patches locally.
+if (!isAdmin) return;
 
     if (!video.ended) setStatus("Paused");
 
